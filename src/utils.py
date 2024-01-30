@@ -7,18 +7,25 @@ from helium import *
 from selenium.common import NoSuchElementException
 from selenium.webdriver.common.by import By
 from datetime import datetime, timedelta
-from exceptions import LoginError
 from logger import logger
+from amazoncaptcha import AmazonCaptcha
+import pyotp
+
 
 STATIC_DATA = {
     "dashboard_url": "https://developer.amazon.com/dashboard",
     "create_new_app_url": "https://developer.amazon.com/apps-and-games/console/app/new.html",
     "scroll_top_query": "document.documentElement.scrollTop = 0;",
+    "logout_url": "https://www.amazon.com/ap/signin?openid.return_to=https%3A%2F%2Fdeveloper.amazon.com%2Fapps-and"
+                  "-games&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid"
+                  ".assoc_handle=mas_dev_portal&openid.mode=logout&openid.claimed_id=http%3A%2F%2Fspecs.openid.net"
+                  "%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&language"
+                  "=en_US",
 
 }
 prompt = """You are an android app description suggestion agent and your job is to generate short description, 
             long description and short feature description of android app by using below provided details and make sure to use 
-            response format as refrence to provide response in the same key value pair, the key name should be strictly followed. 
+            response format as reference to provide response in the same key value pair, the key name should be strictly followed. 
             ### details App Name: {app_name} App Categorie: {app_cat} App Sub Categorie: {app_sub_cat}
 
             ### Response format
@@ -43,12 +50,12 @@ def get_static_filepath(static_path):
             "screenshots_img": "\n".join(screenshots), "apk_filepath": apk_filepath}
     if not icon_114px and icon_512px and apk_filepath and screenshots:
         raise ValueError(f"unable to get all static files.. {data}")
-    logger.info(f"static files are {data}")
+    logger.debug(f"static files are {data}")
     return data
 
 
 def get_descriptions(model, app_name, app_cat, app_sub_cat, retry=0):
-    logger.info(f"Generating descriptions for {app_name}")
+    logger.debug(f"Generating descriptions for {app_name}")
     input_prompt = prompt.format(app_name=app_name, app_cat=app_cat, app_sub_cat=app_sub_cat,
                                  response_format=response_format)
     res = model.generate_content(input_prompt)
@@ -69,37 +76,53 @@ def random_sleep(min_=1, max_=3):
     time.sleep(random.randint(min_, max_))
 
 
-def login(driver, email, password, totp, retry=0):
+def solve_captcha(driver):
     try:
+        link = find_all(S("img", below="Enter the characters you see below"))[0].web_element.get_attribute("src")
+    except IndexError:
+        img = driver.find_element(By.XPATH, "//img[contains(@src, 'https://images-na.ssl-images-amazon.com/captcha')]")
+        link = img.get_attribute("src")
+    logger.debug(f"Extracted captcha link {link}")
+    captcha = AmazonCaptcha.fromlink(link)
+    text = captcha.solve(keep_logs=True)
+    logger.debug(f"Solved captcha, solution text is {text}")
+    write(text, into="Type characters")
+    click(Button("Continue shopping"))
+    return driver
+
+
+def login(driver, email, password, totp, retry=0):
+    totp_obj = pyotp.TOTP(totp)
+    if retry < 1:
         driver.get(STATIC_DATA["dashboard_url"])
         random_sleep()
-        logger.debug(f"entering email {email}")
-        write(email, into='email')
-        random_sleep()
-        logger.debug(f"entering password..")
-        write(password, into='password')
-        driver.execute_script(STATIC_DATA["scroll_top_query"])
-        logger.debug(f"Clicking signin button to login")
-        click("sign in")
-        random_sleep()
-        if "/ap/mfa?ie=" in driver.current_url:
-            logger.debug(f"entering MFA code")
-            write(totp.now(), into="Enter OTP")
-        driver.execute_script(STATIC_DATA["scroll_top_query"])
-        random_sleep()
-        logger.debug(f"Clicking signin button to login")
-        click("sign in")
-        random_sleep()
-        if "home" in driver.current_url:
-            logger.debug("login success")
-    except Exception as e:
-        captcha = driver.find_element(By.XPATH, '//h4[contains(text(), "Enter the characters you see below")]')
-        if retry > 3 or not captcha:
-            raise LoginError
-        logger.debug("Captcha detected waiting for user to fill the captcha")
-        input("captcha detected. Please fill captcha and press enter to continue..")
-        login(driver, email, password, totp, retry=retry+1)
+
+    captcha = driver.find_elements(By.XPATH, '//h4[contains(text(), "Enter the characters you see below")]')
+    if captcha and retry < 3:
+        logger.debug("Captcha detected, Solving captcha..")
+        solve_captcha(driver)
         logger.debug(f"Retrying {retry} times to login")
+        return login(driver, email, password, totp, retry=retry+1)
+
+    logger.debug(f"entering email {email}")
+    write(email, into='email')
+    random_sleep()
+    logger.debug(f"entering password..")
+    write(password, into='password')
+    driver.execute_script(STATIC_DATA["scroll_top_query"])
+    logger.debug(f"Clicking signin button to login")
+    click("sign in")
+    random_sleep()
+    if "/ap/mfa?ie=" in driver.current_url:
+        logger.debug(f"entering MFA code")
+        write(totp_obj.now(), into="Enter OTP")
+    driver.execute_script(STATIC_DATA["scroll_top_query"])
+    random_sleep()
+    logger.debug(f"Clicking signin button to login")
+    click("sign in")
+    random_sleep()
+    if "home" in driver.current_url:
+        logger.debug("login success")
 
 
 def create_new_app(driver, app_name, app_category, app_sub_category):
@@ -172,10 +195,13 @@ def create_app_page2(driver, static_path, game_features, language_support):
         if find_all(S("//h5[text()='1 file(s) uploaded']")):
             logger.debug("Apk file uploaded..")
             break
+        elif find_all(S(".react-toast-notifications__toast__content.css-1ad3zal")):
+            raise AttributeError("Apk file already uploaded. Skipping the current app..")
         random_sleep(min_=1, max_=2)
 
     random_sleep()
-    click(S("//label[@class='orientation-right css-qbmcu0']//span[text()='No']"))
+    # click(S("//label[@class='orientation-right css-qbmcu0']//span[text()='No']"))     # DRM No
+    click(S("//label[@class='orientation-right css-qbmcu0']//span[text()='Yes']"))      # DRM Yes
 
     random_sleep()
     driver.execute_script(STATIC_DATA["scroll_top_query"])
@@ -187,7 +213,10 @@ def create_app_page2(driver, static_path, game_features, language_support):
 def create_app_page3(driver):
     logger.debug("filling details to page 3")
     random_sleep()
-    driver.find_element(By.XPATH, '//*[@id="target-audience-radio-group"]//input[@value="all"]').click()
+    # driver.find_element(By.XPATH, '//*[@id="target-audience-radio-group"]//input[@value="all"]').click()  # all age group
+    driver.find_element(By.XPATH, "//input[@id='16-17 years of age']").click()     # check 16-17 age group
+    random_sleep()
+    driver.find_element(By.XPATH, '//input[@id="18+ years of age"]').click()    # check 18+ age group
     random_sleep()
     driver.find_element(By.XPATH, "//input[@name='collectPrivacyLabel'][@value='no']").click()
 
@@ -219,107 +248,101 @@ def contains_in(text, lst):
 
 
 def create_app_page4(driver, model, app_name, app_category, app_sub_category, static_path):
-    try:
-        random_sleep()
-        data = get_descriptions(model, app_name, app_category, app_sub_category)
-        logger.debug(f"Generated data - {data}")
-        imgs = get_static_filepath(static_path)
-        logger.debug(f"Static paths - {imgs}")
-        write(data["short_description"], into="Short description")
-        random_sleep()
-        write(data["long_description"], into="Long description")
-        random_sleep()
-        write(data["short_feature"], into="Product feature bullets")
-        random_sleep()
-        write(data["keywords"], into="Add keywords")
-        random_sleep()
+    random_sleep()
+    data = get_descriptions(model, app_name, app_category, app_sub_category)
+    logger.debug(f"Generated data - {data}")
+    imgs = get_static_filepath(static_path)
+    logger.debug(f"Static paths - {imgs}")
+    write(data["short_description"], into="Short description")
+    random_sleep()
+    write(data["long_description"], into="Long description")
+    random_sleep()
+    write(data["short_feature"], into="Product feature bullets")
+    random_sleep()
+    write(data["keywords"], into="Add keywords")
+    random_sleep()
 
-        form = None
-        for form in find_all(S("form")):
-            h3 = form.web_element.find_element(By.TAG_NAME, "h3")
-            if h3.text == "Images and videos":
-                logger.debug("Found form with images and videos elements")
-                break
+    form = None
+    for form in find_all(S("form")):
+        h3 = form.web_element.find_element(By.TAG_NAME, "h3")
+        if h3.text == "Images and videos":
+            logger.debug("Found form with images and videos elements")
+            break
 
-        random_sleep()
-        for i in form.web_element.find_elements(By.XPATH,
-                                                "//div[@style='display: flex; gap: 0px; flex-direction: column; width: 50%;']"):
+    random_sleep()
+    for i in form.web_element.find_elements(By.XPATH,
+                                            "//div[@style='display: flex; gap: 0px; flex-direction: column; width: 50%;']"):
 
-            # upload 512px
+        # upload 512px
+        random_sleep(min_=2, max_=4)
+        try:
+            if contains_in(i.text, ["512 x 512px PNG"]):
+                logger.debug("Found 512p icon element to upload icon")
+                attach_file(imgs["icon_512"], to=i.find_element(By.TAG_NAME, "input"))
+                i.find_elements(By.TAG_NAME, "img")
+        except NoSuchElementException:
+            logger.debug("Unable to find 512px icon element")
+
+        try:
             random_sleep(min_=2, max_=4)
-            try:
-                if contains_in(i.text, ["512 x 512px PNG"]):
-                    logger.debug("Found 512p icon element to upload icon")
-                    attach_file(imgs["icon_512"], to=i.find_element(By.TAG_NAME, "input"))
-                    i.find_elements(By.TAG_NAME, "img")
-            except NoSuchElementException:
-                logger.debug("Unable to find 512px icon element")
+            # upload 114px
+            if contains_in(i.text, ["114 x 114px PNG"]):
+                logger.debug("Found 114px icon element to upload icon")
+                attach_file(imgs["icon_114"], to=i.find_element(By.TAG_NAME, "input"))
+                i.find_elements(By.TAG_NAME, "img")
+        except NoSuchElementException:
+            logger.debug("Unable to find 114px element to upload icon")
 
-            try:
-                random_sleep(min_=2, max_=4)
-                # upload 114px
-                if contains_in(i.text, ["114 x 114px PNG"]):
-                    logger.debug("Found 114px icon element to upload icon")
-                    attach_file(imgs["icon_114"], to=i.find_element(By.TAG_NAME, "input"))
-                    i.find_elements(By.TAG_NAME, "img")
-            except NoSuchElementException:
-                logger.debug("Unable to find 114px element to upload icon")
-
-            try:
-                # upload screenshots
-                random_sleep(min_=2, max_=4)
-                if contains_in(i.text, ["Screenshots (minimum 3)"]):
-                    logger.debug("Found screenshot element to upload screenshots")
-                    attach_file(imgs["screenshots_img"], to=i.find_element(By.TAG_NAME, "input"))
-                    i.find_elements(By.TAG_NAME, "img")
-            except NoSuchElementException:
-                logger.error("Unable to find screenshot elements")
-            random_sleep()
-
-        for i in range(120):
-            counter = 0
-            for j in form.web_element.find_elements(By.XPATH,
-                                                    "//div[@style='display: flex; gap: 0px; flex-direction: column; width: 50%;']"):
-                if j.find_elements(By.XPATH, "//img"):
-                    counter += 1
-            if counter >= 3:
-                logger.debug("all images present..")
-                break
-            counter = 0
-            time.sleep(1)
-
-        driver.execute_script(STATIC_DATA["scroll_top_query"])
+        try:
+            # upload screenshots
+            random_sleep(min_=2, max_=4)
+            if contains_in(i.text, ["Screenshots (minimum 3)"]):
+                logger.debug("Found screenshot element to upload screenshots")
+                attach_file(imgs["screenshots_img"], to=i.find_element(By.TAG_NAME, "input"))
+                i.find_elements(By.TAG_NAME, "img")
+        except NoSuchElementException:
+            logger.error("Unable to find screenshot elements")
         random_sleep()
-        driver.find_element(By.XPATH, "//button[text() = 'Next']").click()
-        logger.debug("Clicked on Next button")
-    except Exception as e:
-        logger.exception(e)
+
+    for i in range(120):
+        counter = 0
+        for j in form.web_element.find_elements(By.XPATH,
+                                                "//div[@style='display: flex; gap: 0px; flex-direction: column; width: 50%;']"):
+            if j.find_elements(By.XPATH, "//img"):
+                counter += 1
+        if counter >= 3:
+            logger.debug("all images present..")
+            break
+        counter = 0
+        time.sleep(1)
+
+    driver.execute_script(STATIC_DATA["scroll_top_query"])
+    random_sleep()
+    driver.find_element(By.XPATH, "//button[text() = 'Next']").click()
+    logger.debug("Clicked on Next button")
 
 
 def create_app_page5(driver):
-    try:
-        logger.debug("submitting final page")
-        click("I certify this")
-        random_sleep()
-        publish_time = (datetime.now() + timedelta(hours=1.1)).strftime("%B %d, %Y %H:%M")
-        write(publish_time, into="Select a date")
-        random_sleep()
-        press(ENTER)
-        random_sleep(min_=5, max_=10)
-        submit_button = driver.find_element(By.XPATH, '//button[text()="Submit App"]')
-        if not submit_button.is_enabled():
-            logger.debug("Submit button is disabled, clicking on each image to revalidate the menus..")
-            for i in range(4):
-                menus = get_menu_elements(driver)
-                menus[i].click()
-                logger.debug(f"Clicked {i} menu")
-                random_sleep(min_=2)
-        logger.debug("Clicking on submit button..")
-        submit_button = driver.find_element(By.XPATH, '//button[text()="Submit App"]')
-        submit_button.click()
-        logger.debug("App submitted..")
-    except Exception as e:
-        logger.exception(e)
+    logger.debug("submitting final page")
+    click("I certify this")
+    random_sleep()
+    publish_time = (datetime.now() + timedelta(hours=1.1)).strftime("%B %d, %Y %H:%M")
+    write(publish_time, into="Select a date")
+    random_sleep()
+    press(ENTER)
+    random_sleep(min_=5, max_=10)
+    submit_button = driver.find_element(By.XPATH, '//button[text()="Submit App"]')
+    if not submit_button.is_enabled():
+        logger.debug("Submit button is disabled, clicking on each image to revalidate the menus..")
+        for i in range(4):
+            menus = get_menu_elements(driver)
+            menus[i].click()
+            logger.debug(f"Clicked {i} menu")
+            random_sleep(min_=2)
+    logger.debug("Clicking on submit button..")
+    submit_button = driver.find_element(By.XPATH, '//button[text()="Submit App"]')
+    submit_button.click()
+    logger.debug("App submitted..")
 
 
 def get_menu_elements(driver):
